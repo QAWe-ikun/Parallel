@@ -20,7 +20,7 @@ task0/
 ## 编译方法
 
 ```batch
-cd D:\experiment\Paralleral\task0
+cd .\task0
 compile.bat
 ```
 
@@ -34,7 +34,7 @@ compile.bat
 ### 命令行
 
 ```batch
-cd D:\experiment\Paralleral\task0
+cd .\task0
 
 # Python 基准版本
 python src\matrix.py [M] [K] [N]
