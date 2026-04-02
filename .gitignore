@@ -1,9 +1,6 @@
 # VS Code
 .vscode/
 
-# Qwen
-.qwen/
-
 # Report
 **/docs/
 **/report/
