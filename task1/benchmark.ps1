@@ -3,9 +3,12 @@
 
 $MPIEXEC = "D:\Microsoft MPI\Bin\mpiexec.exe"
 $EXE = "D:\experiment\Parallel\task1\bin\mpi_matrix_mul.exe"
+$SERIAL_EXE = "D:\experiment\Parallel\task1\bin\serial_mat_mul.exe"
 
-$proc_counts = @(2, 4, 8, 16)
+$proc_counts = @(1, 2, 4, 8, 16)
 $matrix_sizes = @(128, 256, 512, 1024, 2048)
+
+$serial_times = @{}
 
 Write-Host "`n============================================" -ForegroundColor Cyan
 Write-Host "  MPI Matrix Multiplication - Performance Test" -ForegroundColor Cyan
@@ -17,7 +20,13 @@ foreach ($procs in $proc_counts) {
     $results[$procs] = @{}
     foreach ($size in $matrix_sizes) {
         Write-Host "Running: $procs procs, size=$size ..." -ForegroundColor Gray
-        $raw = & $MPIEXEC -n $procs $EXE $size 2>&1
+
+        if ($procs -eq 1) {
+            # 单进程直接运行串行版本，不需要 mpiexec
+            $raw = & $SERIAL_EXE $size 2>&1
+        } else {
+            $raw = & $MPIEXEC -n $procs $EXE $size 2>&1
+        }
         $output = $raw | Out-String
         Write-Host $output
 
@@ -34,6 +43,16 @@ foreach ($procs in $proc_counts) {
             if ($line -match 'Parallel Time:\s*([\d.]+)') {
                 $compute_time = [double]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
             }
+        }
+
+        # 记录串行时间（用于填充 1 进程行的加速比 = 1.00x）
+        if (-not $serial_times.ContainsKey($size)) {
+            $serial_times[$size] = $serial_time
+        }
+
+        # 进程数 1 时，compute_time 就是 serial_time
+        if ($procs -eq 1) {
+            $compute_time = $serial_time
         }
 
         $results[$procs][$size] = @{
@@ -58,7 +77,7 @@ foreach ($procs in $proc_counts) {
     $line = "$procs`t"
     foreach ($size in $matrix_sizes) {
         $ct = $results[$procs][$size].Compute
-        $line += ("{0:F3}`t" -f $ct)
+        $line += ("{0:F4}`t" -f $ct)
     }
     Write-Host $line -ForegroundColor Green
 }
@@ -76,7 +95,9 @@ foreach ($procs in $proc_counts) {
     foreach ($size in $matrix_sizes) {
         $st = $results[$procs][$size].Serial
         $ct = $results[$procs][$size].Compute
-        if ($ct -gt 0.00001) {
+        if ($procs -eq 1) {
+            $line += "1.00x`t"
+        } elseif ($ct -gt 0.00001) {
             $speedup = $st / $ct
             $line += ("{0:F2}x`t" -f $speedup)
         } else {
