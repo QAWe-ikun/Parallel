@@ -22,11 +22,8 @@ echo "    OK: bin/heated_plate_openmp"
 
 # 3. Compile Pthreads version (uses thread pool)
 echo "[3/3] Building heated_plate_pthreads..."
-gcc -O3 -march=native -ftree-vectorize -funroll-loops -I"$SCRIPT_DIR/src" -o "$SCRIPT_DIR/bin/heated_plate_pthreads" "$SCRIPT_DIR/src/heated_plate_pthreads.c" -L"$SCRIPT_DIR/lib" -lparallel_for_pool -lpthread -lm -Wl,-rpath,"$SCRIPT_DIR/lib"
+gcc -O3 -march=native -ftree-vectorize -funroll-loops -I"$SCRIPT_DIR/src" -o "$SCRIPT_DIR/bin/heated_plate_pthreads" "$SCRIPT_DIR/src/heated_plate_pthreads.c" -L"$SCRIPT_DIR/lib" -lparallel_for_pool -lpthread -lm -Wl,-rpath,'$ORIGIN/../lib'
 echo "    OK: bin/heated_plate_pthreads"
-
-# Copy shared library to bin for convenience
-cp "$SCRIPT_DIR/lib/libparallel_for_pool.so" "$SCRIPT_DIR/bin/" 2>/dev/null || true
 
 echo ""
 echo "========================================"

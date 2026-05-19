@@ -8,7 +8,7 @@ OPENMP_EXE="$SCRIPT_DIR/bin/heated_plate_openmp"
 PTHREADS_EXE="$SCRIPT_DIR/bin/heated_plate_pthreads"
 export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$LD_LIBRARY_PATH"
 
-THREADS=(1 2 4 8 16)
+THREADS=(1 2 4 8)
 SCHEDULES=( "0 static" "1 dynamic" "2 guided" )
 
 declare -A OPENMP_TIME
