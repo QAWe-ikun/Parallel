@@ -32,7 +32,8 @@ typedef struct {
   _Atomic(int) active_count;
   _Atomic(int) dyn_next;
   int dyn_end, dyn_inc, dyn_chunk;
-  int num_active;
+  int num_active;   // 活跃 worker 数（不含主线程）
+  int num_total;    // 总执行单元数（含主线程）
   int exit_flag;
   int initialized;
 } thread_pool_t;
@@ -63,7 +64,7 @@ static void *worker_thread(void *arg) {
           int chunk;
           if (mode == 2) {
             int rem = end - next;
-            chunk = rem / (2 * g_pool.num_active);
+            chunk = rem / (2 * g_pool.num_total);
             if (chunk < inc) chunk = inc;
           } else {
             chunk = g_pool.dyn_chunk;
@@ -204,11 +205,41 @@ int parallel_for_advanced(int start, int end, int increment,
   }
   }
 
-  g_pool.num_active = nt;
-  atomic_store(&g_pool.active_count, nt);
+  /* 主线程参与计算：唤醒前 nt-1 个 worker，主线程执行第 nt 份工作 */
+  g_pool.num_total = nt;
+  g_pool.num_active = nt - 1;
+  atomic_store(&g_pool.active_count, nt - 1);
 
-  for (int t = 0; t < nt; t++)
+  for (int t = 0; t < nt - 1; t++)
     sem_post(&g_pool.workers[t].work_sem);
+
+  /* 主线程执行自己的那份工作 */
+  if (schedule == SCHEDULE_STATIC) {
+    for (int i = chunks[nt - 1].start; i < chunks[nt - 1].end;
+         i += chunks[nt - 1].increment)
+      functor(i, arg);
+  } else {
+    /* 动态/引导调度：主线程和 worker 一样从 dyn_next 抢任务 */
+    while (1) {
+      int next = atomic_load_explicit(&g_pool.dyn_next, memory_order_relaxed);
+      if (next >= g_pool.dyn_end) break;
+      int chunk;
+      if (schedule == SCHEDULE_GUIDED) {
+        int rem = g_pool.dyn_end - next;
+        chunk = rem / (2 * g_pool.num_total);
+        if (chunk < g_pool.dyn_inc) chunk = g_pool.dyn_inc;
+      } else {
+        chunk = g_pool.dyn_chunk;
+      }
+      int ls =
+          atomic_fetch_add_explicit(&g_pool.dyn_next, chunk, memory_order_relaxed);
+      if (ls >= g_pool.dyn_end) break;
+      int le = ls + chunk;
+      if (le > g_pool.dyn_end) le = g_pool.dyn_end;
+      for (int i = ls; i < le; i += g_pool.dyn_inc)
+        functor(i, arg);
+    }
+  }
 
   while (atomic_load_explicit(&g_pool.active_count, memory_order_acquire) > 0)
     sched_yield();
