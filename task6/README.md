@@ -34,12 +34,6 @@ task6/
 
 ## 编译
 
-### Windows (MinGW-w64)
-
-```bash
-.\compile.bat
-```
-
 ### Linux / WSL
 
 ```bash
@@ -67,9 +61,6 @@ chmod +x compile.sh
 ```bash
 # Linux/WSL
 ./benchmark.sh
-
-# Windows PowerShell
-.\benchmark.ps1
 ```
 
 ## 核心改进：线程池

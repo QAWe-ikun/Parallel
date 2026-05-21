@@ -2,20 +2,31 @@
  * @file parallel_for_pool.c
  * @brief 基于 Pthreads 线程池的并行 for 循环动态链接库
  *
- * semaphore 分发工作 + sched_yield 等待完成。
+ * semaphore 分发工作 + futex 等待完成（用户态自旋 → 必要时进内核）。
  */
 
 #define _GNU_SOURCE
 #include "parallel_for_pool.h"
+#include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <stdatomic.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define MAX_THREADS 8
+
+static inline void futex_wait(int *addr, int val) {
+  syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+}
+
+static inline void futex_wake(int *addr, int n) {
+  syscall(SYS_futex, addr, FUTEX_WAKE, n, NULL, NULL, 0);
+}
 
 typedef struct {
   pthread_t thread;
@@ -32,8 +43,8 @@ typedef struct {
   _Atomic(int) active_count;
   _Atomic(int) dyn_next;
   int dyn_end, dyn_inc, dyn_chunk;
-  int num_active;   // 活跃 worker 数（不含主线程）
-  int num_total;    // 总执行单元数（含主线程）
+  int num_active;
+  int num_total;
   int exit_flag;
   int initialized;
 } thread_pool_t;
@@ -59,7 +70,8 @@ static void *worker_thread(void *arg) {
       } else {
         int end = g_pool.dyn_end, inc = g_pool.dyn_inc;
         while (1) {
-          int next = atomic_load_explicit(&g_pool.dyn_next, memory_order_relaxed);
+          int next =
+              atomic_load_explicit(&g_pool.dyn_next, memory_order_relaxed);
           if (next >= end) break;
           int chunk;
           if (mode == 2) {
@@ -69,7 +81,8 @@ static void *worker_thread(void *arg) {
           } else {
             chunk = g_pool.dyn_chunk;
           }
-          int ls = atomic_fetch_add_explicit(&g_pool.dyn_next, chunk, memory_order_relaxed);
+          int ls = atomic_fetch_add_explicit(&g_pool.dyn_next, chunk,
+                                             memory_order_relaxed);
           if (ls >= end) break;
           int le = ls + chunk;
           if (le > end) le = end;
@@ -78,7 +91,12 @@ static void *worker_thread(void *arg) {
         }
       }
 
-      atomic_fetch_sub_explicit(&g_pool.active_count, 1, memory_order_release);
+      int c = atomic_fetch_sub_explicit(&g_pool.active_count, 1,
+                                        memory_order_release) -
+              1;
+      if (c <= 0) {
+        futex_wake((int *)&g_pool.active_count, 1);
+      }
     }
   }
   return NULL;
@@ -205,7 +223,7 @@ int parallel_for_advanced(int start, int end, int increment,
   }
   }
 
-  /* 主线程参与计算：唤醒前 nt-1 个 worker，主线程执行第 nt 份工作 */
+  /* 主线程参与计算：唤醒前 nt-1 个 worker，主线程执行第 nt 份 */
   g_pool.num_total = nt;
   g_pool.num_active = nt - 1;
   atomic_store(&g_pool.active_count, nt - 1);
@@ -219,7 +237,6 @@ int parallel_for_advanced(int start, int end, int increment,
          i += chunks[nt - 1].increment)
       functor(i, arg);
   } else {
-    /* 动态/引导调度：主线程和 worker 一样从 dyn_next 抢任务 */
     while (1) {
       int next = atomic_load_explicit(&g_pool.dyn_next, memory_order_relaxed);
       if (next >= g_pool.dyn_end) break;
@@ -231,8 +248,8 @@ int parallel_for_advanced(int start, int end, int increment,
       } else {
         chunk = g_pool.dyn_chunk;
       }
-      int ls =
-          atomic_fetch_add_explicit(&g_pool.dyn_next, chunk, memory_order_relaxed);
+      int ls = atomic_fetch_add_explicit(&g_pool.dyn_next, chunk,
+                                         memory_order_relaxed);
       if (ls >= g_pool.dyn_end) break;
       int le = ls + chunk;
       if (le > g_pool.dyn_end) le = g_pool.dyn_end;
@@ -241,8 +258,20 @@ int parallel_for_advanced(int start, int end, int increment,
     }
   }
 
-  while (atomic_load_explicit(&g_pool.active_count, memory_order_acquire) > 0)
-    sched_yield();
+  /* futex 等待：用户态自旋 → 超时进内核，模仿 libgomp barrier */
+  for (int spin = 0;; spin++) {
+    int ac = atomic_load_explicit(&g_pool.active_count, memory_order_acquire);
+    if (ac <= 0) break;
+    if (spin < 1000) {
+      /* 短暂自旋，期待 worker 很快完成 */
+      for (int j = 0; j < 100; j++)
+        ;
+    } else {
+      /* 长时间未完成，进内核等待 */
+      futex_wait((int *)&g_pool.active_count, ac);
+      spin = 0; /* 被唤醒后重新自旋 */
+    }
+  }
 
   return 0;
 }
