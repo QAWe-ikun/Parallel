@@ -1,6 +1,6 @@
 /**
  * @file heated_plate_openmp.c
- * @brief OpenMP 参考实现：稳态热传导模拟
+ * @brief OpenMP 参考实现：稳态热传导模拟（支持动态网格大小）
  *
  * 原始 OpenMP 实现，作为 Pthreads 版本的性能对比基准。
  * 边界条件：上边界 = 0，其余三边 = 100
@@ -9,19 +9,13 @@
  * 编译：
  *   gcc -O2 -fopenmp -o heated_plate_openmp.exe heated_plate_openmp.c -lm
  * 运行：
- *   .\heated_plate_openmp.exe [num_threads]
+ *   .\heated_plate_openmp.exe [num_threads] [grid_size]
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <omp.h>
-
-#define M 500
-#define N 500
-
-static double u[M][N];
-static double w[M][N];
 
 static inline double wtime(void) {
     return omp_get_wtime();
@@ -30,9 +24,23 @@ static inline double wtime(void) {
 int main(int argc, char *argv[]) {
     double epsilon = 0.001;
     int num_threads = 4;
+    int m = 500, n = 500; /* 默认网格大小 */
 
     if (argc > 1) num_threads = atoi(argv[1]);
+    if (argc > 2) {
+      m = atoi(argv[2]);
+      n = m;
+    } /* 支持正方形网格 M=N */
+
     omp_set_num_threads(num_threads);
+
+    /* 动态分配网格 (BSS -> Heap，Valgrind 可追踪) */
+    double *u = (double *)malloc(m * n * sizeof(double));
+    double *w = (double *)malloc(m * n * sizeof(double));
+    if (!u || !w) {
+      fprintf(stderr, "Memory allocation failed for %dx%d grid.\n", m, n);
+      return 1;
+    }
 
     printf("\n");
     printf("HEATED_PLATE_OPENMP\n");
@@ -40,112 +48,121 @@ int main(int argc, char *argv[]) {
     printf("  A program to solve for the steady state temperature distribution\n");
     printf("  over a rectangular plate.\n");
     printf("\n");
-    printf("  Spatial grid of %d by %d points.\n", M, N);
+    printf("  Spatial grid of %d by %d points.\n", m, n);
     printf("  The iteration will be repeated until the change is <= %e\n", epsilon);
     printf("  Number of threads = %d\n", num_threads);
     printf("\n");
 
-    /* ----- 初始化边界条件 ----- */
+/* ----- 初始化边界条件 (u 和 w 都需要) ----- */
 
-    /* 上边界 w[0][j] = 0 */
-    #pragma omp parallel for
-    for (int j = 0; j < N; j++) {
-        w[0][j] = 0.0;
+/* 上边界 = 0 */
+#pragma omp parallel for
+  for (int j = 0; j < n; j++) {
+    w[0 * n + j] = 0.0;
+    u[0 * n + j] = 0.0;
+  }
+
+/* 下边界 = 100 */
+#pragma omp parallel for
+  for (int j = 0; j < n; j++) {
+    w[(m - 1) * n + j] = 100.0;
+    u[(m - 1) * n + j] = 100.0;
+  }
+
+/* 左右边界 = 100 */
+#pragma omp parallel for
+  for (int i = 1; i < m - 1; i++) {
+    w[i * n + 0] = 100.0;
+    w[i * n + (n - 1)] = 100.0;
+    u[i * n + 0] = 100.0;
+    u[i * n + (n - 1)] = 100.0;
+  }
+
+  /* 计算边界平均值 */
+  double boundary_sum = 0.0;
+#pragma omp parallel for reduction(+ : boundary_sum)
+  for (int j = 0; j < n; j++) {
+    boundary_sum += w[0 * n + j] + w[(m - 1) * n + j];
+  }
+#pragma omp parallel for reduction(+ : boundary_sum)
+  for (int i = 1; i < m - 1; i++) {
+    boundary_sum += w[i * n + 0] + w[i * n + (n - 1)];
+  }
+  double boundary_avg = boundary_sum / (2.0 * (m + n - 2));
+
+/* 内部点初始化为边界平均值 */
+#pragma omp parallel for collapse(2)
+  for (int i = 1; i < m - 1; i++) {
+    for (int j = 1; j < n - 1; j++) {
+      w[i * n + j] = boundary_avg;
+      u[i * n + j] = boundary_avg;
     }
+  }
 
-    /* 下边界 w[M-1][j] = 100 */
-    #pragma omp parallel for
-    for (int j = 0; j < N; j++) {
-        w[M - 1][j] = 100.0;
-    }
+  printf("  MEAN = %f\n", boundary_avg);
+  printf("\n");
+  printf(" Iteration  Change\n\n");
 
-    /* 左右边界 */
-    #pragma omp parallel for
-    for (int i = 1; i < M - 1; i++) {
-        w[i][0]     = 100.0;
-        w[i][N - 1] = 100.0;
-    }
+  /* ----- Jacobi 迭代 ----- */
+  double change = 2.0 * epsilon;
+  int it = 0;
+  int next_print = 1; /* 打印点: 1, 8, 64, 512... */
 
-    /* 计算边界平均值 */
-    double boundary_sum = 0.0;
-    #pragma omp parallel for reduction(+:boundary_sum)
-    for (int j = 0; j < N; j++) {
-        boundary_sum += w[0][j] + w[M - 1][j];
-    }
-    #pragma omp parallel for reduction(+:boundary_sum)
-    for (int i = 1; i < M - 1; i++) {
-        boundary_sum += w[i][0] + w[i][N - 1];
-    }
+  double start_time = wtime();
 
-    double mean = boundary_sum / (double)(2 * M + 2 * N - 4);
-    printf("  MEAN = %f\n", mean);
+  while (change > epsilon) {
+    change = 0.0;
+    it++;
 
-    /* 初始化内部点 */
-    #pragma omp parallel for
-    for (int i = 1; i < M - 1; i++) {
-        for (int j = 1; j < N - 1; j++) {
-            w[i][j] = mean;
+#pragma omp parallel
+    {
+      double local_max = 0.0;
+
+#pragma omp for collapse(2)
+      for (int i = 1; i < m - 1; i++) {
+        for (int j = 1; j < n - 1; j++) {
+          u[i * n + j] = 0.25 * (w[(i - 1) * n + j] + w[(i + 1) * n + j] +
+                                 w[i * n + (j - 1)] + w[i * n + (j + 1)]);
+          double diff = fabs(u[i * n + j] - w[i * n + j]);
+          if (diff > local_max)
+            local_max = diff;
         }
+      }
+
+#pragma omp critical
+      {
+        if (local_max > change)
+          change = local_max;
+      }
     }
 
-    /* ----- 迭代直到收敛 ----- */
-    int iterations       = 0;
-    int iterations_print = 1;
-    double diff;
+    /* 交换指针，使 u 成为下一次迭代的 w */
+    double *temp = w;
+    w = u;
+    u = temp;
 
-    printf("\n");
-    printf(" Iteration  Change\n");
-    printf("\n");
-
-    double start_time = wtime();
-    diff = epsilon;
-
-    while (epsilon <= diff) {
-        /* 保存旧解 */
-        #pragma omp parallel for
-        for (int i = 0; i < M; i++) {
-            for (int j = 0; j < N; j++) {
-                u[i][j] = w[i][j];
-            }
-        }
-
-        /* 更新内部点 */
-        #pragma omp parallel for
-        for (int i = 1; i < M - 1; i++) {
-            for (int j = 1; j < N - 1; j++) {
-                w[i][j] = (u[i - 1][j] + u[i + 1][j]
-                         + u[i][j - 1] + u[i][j + 1]) / 4.0;
-            }
-        }
-
-        /* 计算全局最大差值 */
-        diff = 0.0;
-        #pragma omp parallel for reduction(max:diff)
-        for (int i = 1; i < M - 1; i++) {
-            for (int j = 1; j < N - 1; j++) {
-                double d = fabs(w[i][j] - u[i][j]);
-                if (d > diff) diff = d;
-            }
-        }
-
-        iterations++;
-        if (iterations == iterations_print) {
-            printf("  %8d  %f\n", iterations, diff);
-            iterations_print = 2 * iterations_print;
-        }
+    /* 按 8 的 n 次方打印 (1, 8, 64, 512...) */
+    if (it == next_print) {
+      printf(" %8d  %10.6f\n", it, change);
+      next_print *= 8;
     }
+  }
 
-    double end_time      = wtime();
-    double wtime_elapsed = end_time - start_time;
+  double end_time = wtime();
+  double wallclock = end_time - start_time;
 
-    printf("\n");
-    printf("  %8d  %f\n", iterations, diff);
-    printf("\n");
-    printf("  Error tolerance achieved.\n");
-    printf("  Wallclock time = %f\n", wtime_elapsed);
-    printf("\n");
-    printf("HEATED_PLATE_OPENMP:\n");
-    printf("  Normal end of execution.\n");
+  printf("\n");
+  printf(" %8d  %10.6f\n", it, change);
+  printf("\n");
+  printf("  Error tolerance achieved.\n");
+  printf("  Wallclock time = %f\n", wallclock);
 
-    return 0;
+  printf("\n");
+  printf("HEATED_PLATE_OPENMP:\n");
+  printf("  Normal end of execution.\n");
+  printf("\n");
+
+  free(u);
+  free(w);
+  return 0;
 }

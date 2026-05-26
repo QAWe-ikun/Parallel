@@ -19,3 +19,6 @@ obj/
 # Claude
 .claude/
 CLAUDE.md
+
+# Massif
+massif_output/
