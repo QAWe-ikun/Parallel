@@ -43,7 +43,7 @@ for sched_entry in "${SCHEDULES[@]}"; do
     sched_name=$(echo "$sched_entry" | cut -d' ' -f2)
     printf "\n  --- %s ---\n" "$sched_name"
     for t in "${THREADS[@]}"; do
-        output=$("$PTHREADS_EXE" $t $sched_id 1 2>&1)
+        output=$("$PTHREADS_EXE" $t 500 $sched_id 1 2>&1)
         PTHREADS_TIME["${t}_${sched_name}"]=$(extract_wallclock "$output")
         printf "  T=%2d: %s s\n" "$t" "${PTHREADS_TIME[${t}_${sched_name}]}"
     done

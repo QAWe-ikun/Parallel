@@ -1,11 +1,11 @@
 /**
  * @file fft_mpi.c
- * @brief MPI 并行快速傅里叶变换（真正并行版本）
+ * @brief MPI 并行快速傅里叶变换
  *
- * 使用 1D 数据分解策略：
- *   - 每个进程负责 N/P 个数据点的本地 FFT
- *   - 通过 MPI_Alltoallv 进行数据转置
- *   - 本地计算使用串行 step() 函数
+ * 并行策略：在 step() 函数的 j 循环上做数据分配（与 OpenMP 版本相同策略）
+ *   - 所有进程持有完整数据
+ *   - step() 中每个进程只计算 lj/P 个 j 迭代
+ *   - 不同 j 写入不重叠位置，无需通信
  *
  * 编译：
  *   mpicc -O2 -o bin/fft_mpi src/fft_mpi.c -lm
@@ -18,368 +18,332 @@
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+
+/* 全局 MPI 信息 */
+static int g_rank, g_size;
+static MPI_Comm g_comm;
 
 /* 函数声明 */
 void ccopy(int n, double x[], double y[]);
 void cfft2(int n, double x[], double y[], double w[], double sgn);
 void cffti(int n, double w[]);
-double cpu_time(void);
 double ggl(double *seed);
-void step(int n, int mj, double a[], double b[], double c[], double d[],
-          double w[], double sgn);
+void step(int n, int mj, double a[], double b[], double c[],
+          double d[], double w[], double sgn);
 void timestamp(void);
 
-/* MPI 并行 FFT（真正并行版本） */
-void cfft2_mpi_parallel(int n, double x[], double y[], double w[], double sgn,
-                        int rank, int size, MPI_Comm comm);
-
 int main(int argc, char *argv[]) {
-  int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_size);
+    g_comm = MPI_COMM_WORLD;
 
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-
-  if (rank == 0) {
-    timestamp();
-    printf("\n");
-    printf("FFT_MPI_PARALLEL\n");
-    printf("  C/MPI version (true parallel FFT)\n");
-    printf("  Demonstrate an MPI-parallel Fast Fourier Transform\n");
-    printf("  Number of processes = %d\n", size);
-    printf("\n");
-    printf("  Accuracy check:\n");
-    printf("    FFT ( FFT ( X(1:N) ) ) == N * X(1:N)\n");
-    printf("\n");
-    printf("             N      NITS    Error         Time          Time/Call  "
-           "   MFLOPS\n");
-    printf("\n");
-  }
-
-  double ctime, ctime1, ctime2;
-  double error;
-  int first = 1;
-  double flops, fnm1;
-  int i, icase, it, ln2;
-  double mflops;
-  int n = 1;
-  int nits = 1000;
-  double seed = 331.0;
-  double sgn;
-
-  /* 为不同 N 测试 */
-  for (ln2 = 1; ln2 <= 16; ln2++) {
-    n = 2 * n;
-
-    /* 如果 N 不能被 size 整除，跳过 */
-    if (n % size != 0) {
-      if (rank == 0) {
-        printf("  N=%6d  (skipped, not divisible by %d)\n", n, size);
-      }
-      continue;
+    if (g_rank == 0) {
+        timestamp();
+        printf("\n");
+        printf("FFT_MPI\n");
+        printf("  C/MPI version\n");
+        printf("  Number of processes = %d\n", g_size);
+        printf("\n");
+        printf("  Accuracy check:\n");
+        printf("    FFT ( FFT ( X(1:N) ) ) == N * X(1:N)\n");
+        printf("\n");
+        printf("             N      NITS    Error         Time          Time/Call     MFLOPS\n");
+        printf("\n");
     }
 
-    int local_n = n / size;
+    double error;
+    int first;
+    double flops, fnm1;
+    int i, icase, it, ln2;
+    double mflops;
+    int n;
+    int nits = 10000;
+    double seed = 331.0;
+    double sgn;
+    double *w, *x, *y, *z;
 
-    /* 分配存储 */
-    double *w = (double *)malloc(n * sizeof(double));
-    double *x = (double *)malloc(2 * n * sizeof(double));
-    double *y = (double *)malloc(2 * n * sizeof(double));
-    double *z = (double *)malloc(2 * n * sizeof(double));
+    n = 1;
 
-    /* 生成测试数据（所有进程使用相同种子） */
-    double seed_local = seed;
-    if (first) {
-      for (i = 0; i < 2 * n; i += 2) {
-        double z0 = ggl(&seed_local);
-        double z1 = ggl(&seed_local);
-        x[i] = z0;
-        z[i] = z0;
-        x[i + 1] = z1;
-        z[i + 1] = z1;
-      }
-    } else {
-      for (i = 0; i < 2 * n; i += 2) {
-        x[i] = 0.0;
-        z[i] = 0.0;
-        x[i + 1] = 0.0;
-        z[i + 1] = 0.0;
-      }
-    }
+    for (ln2 = 1; ln2 <= 20; ln2++) {
+        n = 2 * n;
 
-    /* 初始化 sine/cosine 表 */
-    cffti(n, w);
+        w = (double *)malloc(n * sizeof(double));
+        x = (double *)malloc(2 * n * sizeof(double));
+        y = (double *)malloc(2 * n * sizeof(double));
+        z = (double *)malloc(2 * n * sizeof(double));
 
-    if (first) {
-      /* 精度测试：FFT(FFT(x)) == N * x */
-      sgn = +1.0;
-      cfft2_mpi_parallel(n, x, y, w, sgn, rank, size, MPI_COMM_WORLD);
-      sgn = -1.0;
-      cfft2_mpi_parallel(n, y, x, w, sgn, rank, size, MPI_COMM_WORLD);
+        first = 1;
 
-      /* 收集结果到 rank 0 进行验证 */
-      double *x_global = NULL;
-      double *z_global = NULL;
-      if (rank == 0) {
-        x_global = (double *)malloc(2 * n * sizeof(double));
-        z_global = (double *)malloc(2 * n * sizeof(double));
-        for (i = 0; i < 2 * n; i++)
-          z_global[i] = z[i];
-      }
-      MPI_Gather(x, 2 * local_n, MPI_DOUBLE, rank == 0 ? x_global : NULL,
-                 2 * local_n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        for (icase = 0; icase < 2; icase++) {
+            if (first) {
+                if (g_rank == 0) {
+                    for (i = 0; i < 2 * n; i += 2) {
+                        double z0 = ggl(&seed);
+                        double z1 = ggl(&seed);
+                        x[i] = z0;
+                        z[i] = z0;
+                        x[i + 1] = z1;
+                        z[i + 1] = z1;
+                    }
+                }
+                MPI_Bcast(x, 2 * n, MPI_DOUBLE, 0, g_comm);
+                MPI_Bcast(z, 2 * n, MPI_DOUBLE, 0, g_comm);
+            } else {
+                memset(x, 0, 2 * n * sizeof(double));
+                memset(z, 0, 2 * n * sizeof(double));
+            }
 
-      if (rank == 0) {
-        fnm1 = 1.0 / (double)n;
-        error = 0.0;
-        for (i = 0; i < 2 * n; i += 2) {
-          error += pow(z_global[i] - fnm1 * x_global[i], 2) +
-                   pow(z_global[i + 1] - fnm1 * x_global[i + 1], 2);
+            cffti(n, w);
+
+            if (first) {
+                sgn = +1.0;
+                cfft2(n, x, y, w, sgn);
+                sgn = -1.0;
+                cfft2(n, y, x, w, sgn);
+
+                if (g_rank == 0) {
+                    fnm1 = 1.0 / (double)n;
+                    error = 0.0;
+                    for (i = 0; i < 2 * n; i += 2) {
+                        error += pow(z[i] - fnm1 * x[i], 2) +
+                                 pow(z[i + 1] - fnm1 * x[i + 1], 2);
+                    }
+                    error = sqrt(fnm1 * error);
+                    printf("  %12d  %8d  %12e", n, nits, error);
+                }
+                first = 0;
+            } else {
+                MPI_Barrier(g_comm);
+                double ctime1 = MPI_Wtime();
+
+                for (it = 0; it < nits; it++) {
+                    sgn = +1.0;
+                    cfft2(n, x, y, w, sgn);
+                    sgn = -1.0;
+                    cfft2(n, y, x, w, sgn);
+                }
+
+                MPI_Barrier(g_comm);
+                double ctime = MPI_Wtime() - ctime1;
+
+                flops = 2.0 * (double)nits * (5.0 * (double)n * (double)ln2);
+                mflops = flops / 1.0E+06 / ctime;
+
+                if (g_rank == 0) {
+                    printf("  %12e  %12e  %12f\n",
+                           ctime, ctime / (double)(2 * nits), mflops);
+                }
+            }
         }
-        error = sqrt(fnm1 * error);
-        printf("  %6d  %6d  %12.6e", n, nits, error);
-        free(x_global);
-        free(z_global);
-      }
-      first = 0;
-    } else {
-      /* 性能测试 */
-      MPI_Barrier(MPI_COMM_WORLD);
-      ctime1 = MPI_Wtime();
-      for (it = 0; it < nits; it++) {
-        sgn = +1.0;
-        cfft2_mpi_parallel(n, x, y, w, sgn, rank, size, MPI_COMM_WORLD);
-        sgn = -1.0;
-        cfft2_mpi_parallel(n, y, x, w, sgn, rank, size, MPI_COMM_WORLD);
-      }
-      MPI_Barrier(MPI_COMM_WORLD);
-      ctime2 = MPI_Wtime();
-      ctime = ctime2 - ctime1;
 
-      flops = 2.0 * (double)nits * (5.0 * (double)n * (double)ln2);
-      mflops = flops / 1.0E+06 / ctime;
+        if ((ln2 % 4) == 0) {
+            nits = nits / 10;
+        }
+        if (nits < 1) {
+            nits = 1;
+        }
 
-      if (rank == 0) {
-        printf("  %6d  %6d  %12.6e  %12.6f  %12.6f  %12.2f\n", n, nits, 0.0,
-               ctime, ctime / (double)(2 * nits), mflops);
-      }
+        free(w);
+        free(x);
+        free(y);
+        free(z);
     }
 
-    free(w);
-    free(x);
-    free(y);
-    free(z);
-
-    /* 调整 nits */
-    if ((ln2 % 4) == 0) {
-      nits = nits / 10;
+    if (g_rank == 0) {
+        printf("\n");
+        printf("FFT_MPI:\n");
+        printf("  Normal end of execution.\n");
+        printf("\n");
+        timestamp();
     }
-    if (nits < 1) {
-      nits = 1;
-    }
-  }
 
-  if (rank == 0) {
-    printf("\n");
-    printf("FFT_MPI_PARALLEL:\n");
-    printf("  Normal end of execution.\n");
-    printf("\n");
-    timestamp();
-  }
-
-  MPI_Finalize();
-  return 0;
+    MPI_Finalize();
+    return 0;
 }
 
-/**
- * @brief 真正的 MPI 并行 FFT
- *
- * 使用 1D 数据分解策略：
- * 1. 每个进程拥有连续的 n/size 个数据点
- * 2. 通过数据重排使每个进程可以独立计算本地 FFT
- * 3. 使用 MPI_Alltoallv 进行数据转置
- */
-void cfft2_mpi_parallel(int n, double x[], double y[], double w[], double sgn,
-                        int rank, int size, MPI_Comm comm) {
-  int local_n = n / size;
-  int i;
-
-  /* 每个进程的本地缓冲区 */
-  double *local_x = (double *)malloc(2 * local_n * sizeof(double));
-  double *local_y = (double *)malloc(2 * local_n * sizeof(double));
-  double *local_w = (double *)malloc(local_n * sizeof(double));
-
-  /* 提取本地数据 */
-  for (i = 0; i < 2 * local_n; i++) {
-    local_x[i] = x[rank * 2 * local_n + i];
-  }
-
-  /* 初始化本地 sine/cosine 表 */
-  cffti(local_n, local_w);
-
-  /*
-   * 简化的并行策略：
-   * 由于 FFT 的 butterfly 操作需要全局数据重排，
-   * 这里我们采用：每个进程独立计算本地 FFT
-   * 然后使用 MPI_Alltoallv 进行结果重组
-   *
-   * 注意：这不是完全正确的 FFT，但展示了 MPI 并行化的基本思路
-   * 完全正确的 MPI FFT 需要更复杂的数据重排算法
-   */
-
-  /* 本地 FFT 计算 */
-  cfft2(local_n, local_x, local_y, local_w, sgn);
-
-  /* 将结果散布到全局数组 */
-  MPI_Allgather(local_y, 2 * local_n, MPI_DOUBLE, y, 2 * local_n, MPI_DOUBLE,
-                comm);
-
-  /*
-   * 数据重排：使用 MPI_Alltoallv
-   * 将每个进程的数据按块分发给所有其他进程
-   */
-  double *temp = (double *)malloc(2 * n * sizeof(double));
-  double *recv = (double *)malloc(2 * n * sizeof(double));
-
-  /* 准备发送数据 */
-  for (i = 0; i < size; i++) {
-    for (int j = 0; j < 2 * local_n; j++) {
-      temp[i * 2 * local_n + j] = y[i * 2 * local_n + j];
-    }
-  }
-
-  /* Alltoallv 数据转置 */
-  MPI_Alltoall(temp, 2 * local_n, MPI_DOUBLE, recv, 2 * local_n, MPI_DOUBLE,
-               comm);
-
-  /* 将重组后的数据复制回 y */
-  for (i = 0; i < 2 * n; i++) {
-    y[i] = recv[i];
-  }
-
-  free(local_x);
-  free(local_y);
-  free(local_w);
-  free(temp);
-  free(recv);
-}
-
-/* 以下为串行辅助函数（与 fft_serial.cpp 相同） */
+/* ============================================================
+ *  并行 FFT 函数
+ * ============================================================ */
 
 void ccopy(int n, double x[], double y[]) {
-  for (int i = 0; i < n; i++) {
-    y[i * 2 + 0] = x[i * 2 + 0];
-    y[i * 2 + 1] = x[i * 2 + 1];
-  }
+    for (int i = 0; i < n; i++) {
+        y[i * 2 + 0] = x[i * 2 + 0];
+        y[i * 2 + 1] = x[i * 2 + 1];
+    }
 }
 
 void cfft2(int n, double x[], double y[], double w[], double sgn) {
-  int m = (int)(log((double)n) / log(1.99));
-  int mj = 1;
-  int tgle = 1;
-  step(n, mj, &x[0 * 2 + 0], &x[(n / 2) * 2 + 0], &y[0 * 2 + 0], &y[mj * 2 + 0],
-       w, sgn);
+    int m = (int)(log((double)n) / log(1.99));
+    int mj = 1;
+    int tgle = 1;
 
-  if (n == 2)
-    return;
+    step(n, mj, &x[0], &x[(n / 2) * 2], &y[0], &y[mj * 2], w, sgn);
 
-  for (int j = 0; j < m - 2; j++) {
-    mj = mj * 2;
-    if (tgle) {
-      step(n, mj, &y[0 * 2 + 0], &y[(n / 2) * 2 + 0], &x[0 * 2 + 0],
-           &x[mj * 2 + 0], w, sgn);
-      tgle = 0;
-    } else {
-      step(n, mj, &x[0 * 2 + 0], &x[(n / 2) * 2 + 0], &y[0 * 2 + 0],
-           &y[mj * 2 + 0], w, sgn);
-      tgle = 1;
+    if (n == 2) return;
+
+    for (int j = 0; j < m - 2; j++) {
+        mj = mj * 2;
+        if (tgle) {
+            step(n, mj, &y[0], &y[(n / 2) * 2], &x[0], &x[mj * 2], w, sgn);
+            tgle = 0;
+        } else {
+            step(n, mj, &x[0], &x[(n / 2) * 2], &y[0], &y[mj * 2], w, sgn);
+            tgle = 1;
+        }
     }
-  }
 
-  if (tgle) {
-    ccopy(n, y, x);
-  }
+    if (tgle) {
+        ccopy(n, y, x);
+    }
 
-  mj = n / 2;
-  step(n, mj, &x[0 * 2 + 0], &x[(n / 2) * 2 + 0], &y[0 * 2 + 0], &y[mj * 2 + 0],
-       w, sgn);
+    mj = n / 2;
+    step(n, mj, &x[0], &x[(n / 2) * 2], &y[0], &y[mj * 2], w, sgn);
 }
 
 void cffti(int n, double w[]) {
-  double arg, aw;
-  int i, n2;
-  const double pi = 3.141592653589793;
+    double arg, aw;
+    int i, n2;
+    const double pi = 3.141592653589793;
 
-  n2 = n / 2;
-  aw = 2.0 * pi / ((double)n);
+    n2 = n / 2;
+    aw = 2.0 * pi / ((double)n);
 
-  for (i = 0; i < n2; i++) {
-    arg = aw * ((double)i);
-    w[i * 2 + 0] = cos(arg);
-    w[i * 2 + 1] = sin(arg);
-  }
+    for (i = 0; i < n2; i++) {
+        arg = aw * ((double)i);
+        w[i * 2 + 0] = cos(arg);
+        w[i * 2 + 1] = sin(arg);
+    }
 }
-
-double cpu_time(void) { return (double)clock() / (double)CLOCKS_PER_SEC; }
 
 double ggl(double *seed) {
-  double d2 = 0.2147483647e10;
-  double t, value;
+    double d2 = 0.2147483647e10;
+    double t, value;
 
-  t = *seed;
-  t = fmod(16807.0 * t, d2);
-  *seed = t;
-  value = (t - 1.0) / (d2 - 1.0);
+    t = *seed;
+    t = fmod(16807.0 * t, d2);
+    *seed = t;
+    value = (t - 1.0) / (d2 - 1.0);
 
-  return value;
+    return value;
 }
 
-void step(int n, int mj, double a[], double b[], double c[], double d[],
-          double w[], double sgn) {
-  double ambr, ambu;
-  int j, ja, jb, jc, jd, jw, k, lj, mj2;
-  double wjw[2];
+/**
+ * step() - 并行版本
+ *
+ * 与 OpenMP 版本相同策略：在 j 循环上做分配
+ * 每个进程计算 j ∈ [j_start, j_end) 的 butterfly 操作
+ *
+ * 不同 j 写入 c/d 的位置不重叠（j 写到 [j*mj2, (j+1)*mj2)），
+ * 但下一步 step() 需要完整的 c/d 作为输入，
+ * 因此必须用 MPI_Allreduce(SUM) 将各进程的部分结果合并为完整数组。
+ */
+void step(int n, int mj, double a[], double b[], double c[],
+          double d[], double w[], double sgn) {
+    double ambr, ambu;
+    int j, ja, jb, jc, jd, jw, k, lj, mj2;
+    double wjw[2];
 
-  mj2 = 2 * mj;
-  lj = n / mj2;
+    mj2 = 2 * mj;
+    lj = n / mj2;
 
-  for (j = 0; j < lj; j++) {
-    jw = j * mj;
-    ja = jw;
-    jb = ja;
-    jc = j * mj2;
-    jd = jc;
+    /* 分配 j 循环给各进程 */
+    int j_base = lj / g_size;
+    int j_rem = lj % g_size;
+    int j_start = g_rank * j_base + (g_rank < j_rem ? g_rank : j_rem);
+    int j_end = j_start + j_base + (g_rank < j_rem ? 1 : 0);
 
-    wjw[0] = w[jw * 2 + 0];
-    wjw[1] = w[jw * 2 + 1];
+    if (g_size == 1) {
+        /* 单进程：直接计算，无通信开销 */
+        for (j = 0; j < lj; j++) {
+            jw = j * mj;
+            ja = jw;
+            jb = ja;
+            jc = j * mj2;
+            jd = jc;
 
-    if (sgn < 0.0) {
-      wjw[1] = -wjw[1];
+            wjw[0] = w[jw * 2 + 0];
+            wjw[1] = w[jw * 2 + 1];
+            if (sgn < 0.0) wjw[1] = -wjw[1];
+
+            for (k = 0; k < mj; k++) {
+                c[(jc + k) * 2 + 0] = a[(ja + k) * 2 + 0] + b[(jb + k) * 2 + 0];
+                c[(jc + k) * 2 + 1] = a[(ja + k) * 2 + 1] + b[(jb + k) * 2 + 1];
+
+                ambr = a[(ja + k) * 2 + 0] - b[(jb + k) * 2 + 0];
+                ambu = a[(ja + k) * 2 + 1] - b[(jb + k) * 2 + 1];
+
+                d[(jd + k) * 2 + 0] = wjw[0] * ambr - wjw[1] * ambu;
+                d[(jd + k) * 2 + 1] = wjw[1] * ambr + wjw[0] * ambu;
+            }
+        }
+    } else {
+        /* 多进程：各进程计算自己的 j 区间，写入局部数组，然后 Allreduce 合并
+         *
+         * 为什么需要 Allreduce：
+         *   cfft2() 中相邻 step() 调用的输入依赖上一步的完整输出。
+         *   每个进程只计算了部分 j，c/d 只有部分位置有值，
+         *   必须通过 Allreduce(SUM) 让所有进程都得到完整数组。
+         *
+         * 为什么用 SUM：
+         *   不同 j 写入不重叠位置，非本进程位置保持 0，
+         *   SUM 后每个位置恰好只有一个进程的非零贡献。
+         */
+        int arr_len = 2 * n;
+        /* 单个临时数组，模拟 y 数组的完整布局 */
+        double *local_y = (double *)calloc(arr_len, sizeof(double));
+        double *tmp_y = (double *)malloc(arr_len * sizeof(double));
+
+        /* d 相对于 c 的偏移量（以 double 为单位） */
+        int d_offset = mj * 2;
+
+        for (j = j_start; j < j_end; j++) {
+            jw = j * mj;
+            ja = jw;
+            jb = ja;
+            jc = j * mj2;
+            jd = jc;
+
+            wjw[0] = w[jw * 2 + 0];
+            wjw[1] = w[jw * 2 + 1];
+            if (sgn < 0.0) wjw[1] = -wjw[1];
+
+            for (k = 0; k < mj; k++) {
+                /* c 的位置：相对于 c 指针（即 y[0]） */
+                local_y[(jc + k) * 2 + 0] = a[(ja + k) * 2 + 0] + b[(jb + k) * 2 + 0];
+                local_y[(jc + k) * 2 + 1] = a[(ja + k) * 2 + 1] + b[(jb + k) * 2 + 1];
+
+                ambr = a[(ja + k) * 2 + 0] - b[(jb + k) * 2 + 0];
+                ambu = a[(ja + k) * 2 + 1] - b[(jb + k) * 2 + 1];
+
+                /* d 的位置：相对于 c 指针偏移 d_offset */
+                local_y[d_offset + (jd + k) * 2 + 0] = wjw[0] * ambr - wjw[1] * ambu;
+                local_y[d_offset + (jd + k) * 2 + 1] = wjw[1] * ambr + wjw[0] * ambu;
+            }
+        }
+
+        /* 单一 Allreduce 合并整个 y 数组 */
+        MPI_Allreduce(local_y, tmp_y, arr_len, MPI_DOUBLE, MPI_SUM, g_comm);
+
+        /* 复制回 c（即 y[0]），包含 c 和 d 的所有值 */
+        memcpy(c, tmp_y, arr_len * sizeof(double));
+
+        free(local_y);
+        free(tmp_y);
     }
-
-    for (k = 0; k < mj; k++) {
-      c[(jc + k) * 2 + 0] = a[(ja + k) * 2 + 0] + b[(jb + k) * 2 + 0];
-      c[(jc + k) * 2 + 1] = a[(ja + k) * 2 + 1] + b[(jb + k) * 2 + 1];
-
-      ambr = a[(ja + k) * 2 + 0] - b[(jb + k) * 2 + 0];
-      ambu = a[(ja + k) * 2 + 1] - b[(jb + k) * 2 + 1];
-
-      d[(jd + k) * 2 + 0] = wjw[0] * ambr - wjw[1] * ambu;
-      d[(jd + k) * 2 + 1] = wjw[1] * ambr + wjw[0] * ambu;
-    }
-  }
 }
 
 void timestamp(void) {
-  time_t now;
-  struct tm *tm_info;
-  char time_buffer[40];
+    time_t now;
+    struct tm *tm_info;
+    char time_buffer[40];
 
-  now = time(NULL);
-  tm_info = localtime(&now);
+    now = time(NULL);
+    tm_info = localtime(&now);
 
-  strftime(time_buffer, 40, "%d %B %Y %I:%M:%S %p", tm_info);
+    strftime(time_buffer, 40, "%d %B %Y %I:%M:%S %p", tm_info);
 
-  printf("%s\n", time_buffer);
+    printf("%s\n", time_buffer);
 }

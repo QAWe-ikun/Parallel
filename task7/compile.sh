@@ -10,7 +10,7 @@ echo "========================================"
 echo "  Task7 - Build Script"
 echo "========================================"
 
-mkdir -p "$SCRIPT_DIR/bin" "$SCRIPT_DIR/obj"
+mkdir -p "$SCRIPT_DIR/bin"
 
 # 检查 MPI 编译器
 if ! command -v mpicc &> /dev/null; then
@@ -18,12 +18,12 @@ if ! command -v mpicc &> /dev/null; then
     exit 1
 fi
 
-# 1. 编译串行 FFT
+# 1. 编译串行 FFT (C++ 版本)
 echo "[1/2] Building fft_serial..."
-gcc -O2 -o "$SCRIPT_DIR/bin/fft_serial" "$SCRIPT_DIR/docs/fft_serial.cpp" -lm -lstdc++
+g++ -O2 -o "$SCRIPT_DIR/bin/fft_serial" "$SCRIPT_DIR/docs/fft_serial.cpp" -lm
 echo "    OK: bin/fft_serial"
 
-# 2. 编译 MPI FFT
+# 2. 编译 MPI FFT (C 版本)
 echo "[2/2] Building fft_mpi..."
 mpicc -O2 -o "$SCRIPT_DIR/bin/fft_mpi" "$SCRIPT_DIR/src/fft_mpi.c" -lm
 echo "    OK: bin/fft_mpi"

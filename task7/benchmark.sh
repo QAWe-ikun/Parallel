@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERIAL_EXE="$SCRIPT_DIR/bin/fft_serial"
 MPI_EXE="$SCRIPT_DIR/bin/fft_mpi"
 
-MPIRUN="mpirun"
+MPIRUN="mpirun --oversubscribe"
 PROCS=(1 2 4 8)
 
 echo ""
@@ -15,9 +15,11 @@ echo "  Task7 - MPI FFT Performance Benchmark"
 echo "============================================"
 echo ""
 
+mkdir -p "$SCRIPT_DIR/results"
+
 # 串行版本
 echo "[1] 运行串行 FFT..."
-"$SERIAL_EXE" > "$SCRIPT_DIR/serial_output.txt" 2>&1
+"$SERIAL_EXE" > "$SCRIPT_DIR/results/serial_output.txt" 2>&1
 echo "  完成"
 echo ""
 
@@ -25,8 +27,8 @@ echo ""
 echo "[2] 运行 MPI 并行 FFT..."
 for p in "${PROCS[@]}"; do
     echo "  --- $p processes ---"
-    "$MPIRUN" -np $p "$MPI_EXE" > "$SCRIPT_DIR/mpi_p${p}_output.txt" 2>&1
-    grep -E "^\s+[0-9]+" "$SCRIPT_DIR/mpi_p${p}_output.txt" | head -10
+    $MPIRUN -np $p "$MPI_EXE" > "$SCRIPT_DIR/results/mpi_p${p}_output.txt" 2>&1
+    grep -E "^\s+[0-9]+" "$SCRIPT_DIR/results/mpi_p${p}_output.txt" | head -10
     echo ""
 done
 
@@ -37,12 +39,12 @@ echo ""
 
 # 提取各版本的时间
 echo "串行版本:"
-grep -E "^\s+[0-9]+" "$SCRIPT_DIR/serial_output.txt" | tail -5
+grep -E "^\s+[0-9]+" "$SCRIPT_DIR/results/serial_output.txt" | tail -5
 echo ""
 
 for p in "${PROCS[@]}"; do
     echo "$p 进程 MPI:"
-    grep -E "^\s+[0-9]+" "$SCRIPT_DIR/mpi_p${p}_output.txt" | tail -5
+    grep -E "^\s+[0-9]+" "$SCRIPT_DIR/results/mpi_p${p}_output.txt" | tail -5
     echo ""
 done
 

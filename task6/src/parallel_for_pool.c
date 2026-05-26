@@ -1,22 +1,41 @@
 /**
  * @file parallel_for_pool.c
- * @brief 基于 Pthreads 的线程池 parallel_for 实现（稳健版）
+ * @brief 基于 Pthreads 的线程池 parallel_for 实现（Futex 自旋版）
  *
- * 使用 Phase + Atomic Counter + Mutex/CondVar 模式。
- * 修复了死锁问题，并优化了同步开销。
+ * 同步策略：用户态自旋 + Linux futex 混合等待
+ *   - Worker：先自旋 SPIN_COUNT 次（纯用户态）→ 超时才 futex_wait
+ *   - 主线程：直接 futex_wait（避免忙等竞态）
+ *
+ * 对标 OpenMP (libgomp) 的 GOMP_SPINCOUNT 机制
  */
 
 #define _GNU_SOURCE
 #include "parallel_for_pool.h"
+#include <linux/futex.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define MAX_THREADS 64
+#define SPIN_COUNT 300000 /* 与 libgomp 默认 GOMP_SPINCOUNT 相同 */
+
+/* ============================================================
+ *  Futex 辅助函数
+ * ============================================================ */
+
+static inline void futex_wait(volatile int *addr, int val) {
+  syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+}
+
+static inline void futex_wake(volatile int *addr, int count) {
+  syscall(SYS_futex, addr, FUTEX_WAKE, count, NULL, NULL, 0);
+}
+
+static inline void cpu_pause(void) { __asm__ __volatile__("pause"); }
 
 /* ============================================================
  *  线程池全局状态
@@ -25,37 +44,29 @@
 typedef struct {
   pthread_t thread;
   int id;
+  volatile int signal; /* 主线程设置=1 唤醒 worker */
 } worker_t;
 
 typedef struct {
   worker_t workers[MAX_THREADS];
   int num_workers;
 
-  /* 同步原语 */
-  pthread_mutex_t mutex;
-  pthread_cond_t work_cv; /* 唤醒工作线程 */
-  pthread_cond_t done_cv; /* 唤醒主线程 */
-
-  /* 状态标记 */
-  int phase;               /* 任务代次，每次调用递增 */
-  atomic_int active_count; /* 剩余活跃线程数 */
-  int num_active;          /* 本轮请求的线程总数 */
-
-  /* 任务参数 */
+  /* 任务参数（只在主线程写、worker 读，通过 signal 的 release/acquire 保证可见性） */
   void *(*functor)(int, void *);
   void *arg;
   int start, end, inc;
-  int mode;            /* 0=Static, 1=Dynamic, 2=Guided */
-  int chunk;           /* 动态调度块大小 */
-  atomic_int dyn_next; /* 动态调度计数器 */
+  int mode;  /* 0=Static, 1=Dynamic, 2=Guided */
+  int chunk;
+  int num_active;
+
+  atomic_int dyn_next;     /* 动态调度计数器 */
+  atomic_int active_count; /* 剩余活跃线程数 */
+  volatile int done_signal; /* 最后一个 worker 设置=1 唤醒主线程 */
 
   int exit_flag;
 } pool_t;
 
 static pool_t g_pool = {0};
-
-/* 每个线程记录上次处理的 phase，用于判断是否有新任务 */
-static int worker_last_phase[MAX_THREADS] = {0};
 
 /* ============================================================
  *  Worker 线程逻辑
@@ -63,25 +74,31 @@ static int worker_last_phase[MAX_THREADS] = {0};
 
 static void *worker_func(void *arg) {
   worker_t *w = (worker_t *)arg;
-  int my_id = w->id;
 
   while (1) {
-    /* --- 1. 等待任务 --- */
-    pthread_mutex_lock(&g_pool.mutex);
-
-    /* 等待 phase 变化（有新任务）或退出标志 */
-    while (worker_last_phase[my_id] == g_pool.phase && !g_pool.exit_flag) {
-      pthread_cond_wait(&g_pool.work_cv, &g_pool.mutex);
+    /* --- 1. 等待任务（自旋 + futex 混合等待） --- */
+    for (;;) {
+      /* 先自旋（纯用户态，纳秒级） */
+      for (int i = 0; i < SPIN_COUNT; i++) {
+        if (__atomic_load_n(&w->signal, __ATOMIC_ACQUIRE))
+          goto got_signal;
+        if (__atomic_load_n(&g_pool.exit_flag, __ATOMIC_RELAXED))
+          return NULL;
+        cpu_pause();
+      }
+      /* 自旋超时，进内核等待 */
+      if (__atomic_load_n(&w->signal, __ATOMIC_ACQUIRE))
+        goto got_signal;
+      if (__atomic_load_n(&g_pool.exit_flag, __ATOMIC_RELAXED))
+        return NULL;
+      futex_wait(&w->signal, 0);
     }
+  got_signal:
 
-    if (g_pool.exit_flag) {
-      pthread_mutex_unlock(&g_pool.mutex);
-      return NULL;
-    }
+    /* 消费信号 */
+    __atomic_store_n(&w->signal, 0, __ATOMIC_RELEASE);
 
-    /* 领取任务参数（此时持有锁，保证参数一致性） */
-    worker_last_phase[my_id] = g_pool.phase;
-
+    /* --- 2. 读取任务参数（acquire 保证可见性） --- */
     void *(*fn)(int, void *) = g_pool.functor;
     void *farg = g_pool.arg;
     int start = g_pool.start;
@@ -89,30 +106,23 @@ static void *worker_func(void *arg) {
     int inc = g_pool.inc;
     int mode = g_pool.mode;
     int chunk = g_pool.chunk;
-    int nt = g_pool.num_active; /* 活跃线程总数，用于静态调度划分 */
+    int nt = g_pool.num_active;
 
-    pthread_mutex_unlock(&g_pool.mutex);
-
-    /* --- 2. 执行工作 --- */
+    /* --- 3. 执行工作 --- */
     if (mode == 0) {
-      /* 静态调度：基于线程 ID 分配连续块 */
+      /* 静态调度：按 ID 分配连续块 */
       int total_iters = (end - start + inc - 1) / inc;
       int base = total_iters / nt;
       int rem = total_iters % nt;
 
-      /* 计算当前线程负责的起始索引和数量 */
-      int my_start_idx = my_id * base + (my_id < rem ? my_id : rem);
-      int my_count = base + (my_id < rem ? 1 : 0);
+      int my_start_idx = w->id * base + (w->id < rem ? w->id : rem);
+      int my_count = base + (w->id < rem ? 1 : 0);
 
-      /* 转换为实际迭代值 */
       int val = start + my_start_idx * inc;
       int val_end = val + my_count * inc;
 
-      /* 边界保护 */
-      if (val < start)
-        val = start;
-      if (val_end > end)
-        val_end = end;
+      if (val < start) val = start;
+      if (val_end > end) val_end = end;
 
       for (; val < val_end; val += inc) {
         fn(val, farg);
@@ -120,44 +130,37 @@ static void *worker_func(void *arg) {
     } else {
       /* 动态/引导调度：原子领取 */
       int my_chunk = chunk;
-      if (my_chunk <= 0)
-        my_chunk = 1;
+      if (my_chunk <= 0) my_chunk = 1;
 
       while (1) {
         int next = atomic_fetch_add_explicit(&g_pool.dyn_next, my_chunk,
                                              memory_order_relaxed);
-        if (next >= end)
-          break;
+        if (next >= end) break;
 
         int le = next + my_chunk;
-        if (le > end)
-          le = end;
+        if (le > end) le = end;
 
         for (int i = next; i < le; i += inc) {
           fn(i, farg);
         }
 
-        /* 引导调度：逐渐减小 chunk */
         if (mode == 2 && my_chunk > inc) {
           my_chunk /= 2;
-          if (my_chunk < inc)
-            my_chunk = inc;
+          if (my_chunk < inc) my_chunk = inc;
         }
       }
     }
 
-    /* --- 3. 报告完成 --- */
-    /* 原子递减活跃计数 */
+    /* --- 4. 报告完成 --- */
     int remaining = atomic_fetch_sub_explicit(&g_pool.active_count, 1,
-                                              memory_order_release) -
-                    1;
-    if (remaining <= 0) {
-      /* 最后一个完成的线程唤醒主线程 */
-      pthread_mutex_lock(&g_pool.mutex);
-      pthread_cond_signal(&g_pool.done_cv);
-      pthread_mutex_unlock(&g_pool.mutex);
+                                              memory_order_acq_rel) - 1;
+    if (remaining == 0) {
+      /* 最后一个完成的 worker 唤醒主线程 */
+      __atomic_store_n(&g_pool.done_signal, 1, __ATOMIC_RELEASE);
+      futex_wake(&g_pool.done_signal, 1);
     }
   }
+
   return NULL;
 }
 
@@ -171,20 +174,14 @@ static int pool_init(int max_workers) {
 
   int old_max = g_pool.num_workers;
 
-  /* 如果还没初始化过 */
   if (old_max == 0) {
-    pthread_mutex_init(&g_pool.mutex, NULL);
-    pthread_cond_init(&g_pool.work_cv, NULL);
-    pthread_cond_init(&g_pool.done_cv, NULL);
     g_pool.exit_flag = 0;
-    g_pool.phase = 0;
-    memset(worker_last_phase, 0, sizeof(worker_last_phase));
+    g_pool.done_signal = 0;
   }
 
-  /* 创建新线程 */
   for (int i = old_max; i < max_workers; i++) {
     g_pool.workers[i].id = i;
-    worker_last_phase[i] = 0; /* 新线程初始 phase 为 0 */
+    g_pool.workers[i].signal = 0;
     if (pthread_create(&g_pool.workers[i].thread, NULL, worker_func,
                        &g_pool.workers[i]) != 0) {
       fprintf(stderr, "Thread creation failed for id %d\n", i);
@@ -220,20 +217,18 @@ int parallel_for_advanced(int start, int end, int increment,
     return 0;
   }
 
-  /* 确保线程池足够大 */
-  int pool_size =
-      (num_threads > 16) ? num_threads : 16; /* 至少预分配 16 个线程 */
-  if (pool_init(pool_size) != 0)
-    return -1;
+  /* 动态扩展线程池 */
+  if (g_pool.num_workers < num_threads) {
+    if (pool_init(num_threads) != 0)
+      return -1;
+  }
 
-  /* 限制线程数不超过总迭代次数 */
+  /* 限制线程数 */
   int total_iters = (end - start + increment - 1) / increment;
   if (num_threads > total_iters)
     num_threads = total_iters;
 
-  /* --- 分发任务 --- */
-  pthread_mutex_lock(&g_pool.mutex);
-
+  /* --- 设置任务参数（在 signal 之前写，release 保证可见性） --- */
   g_pool.functor = functor;
   g_pool.arg = arg;
   g_pool.start = start;
@@ -241,26 +236,27 @@ int parallel_for_advanced(int start, int end, int increment,
   g_pool.inc = increment;
   g_pool.mode = config->schedule;
   g_pool.chunk = (config->chunk_size > 0) ? config->chunk_size : 1;
-  g_pool.num_active = num_threads; /* 用于静态调度计算 */
+  g_pool.num_active = num_threads;
 
-  /* 重置动态调度计数器 */
   if (config->schedule != SCHEDULE_STATIC) {
     atomic_store(&g_pool.dyn_next, start);
   }
 
-  /* 设置活跃计数 */
-  atomic_store(&g_pool.active_count, num_threads);
+  atomic_store_explicit(&g_pool.active_count, num_threads, memory_order_release);
 
-  /* 推进 phase 并广播 */
-  g_pool.phase++;
-  pthread_cond_broadcast(&g_pool.work_cv);
+  /* 重置完成信号 */
+  __atomic_store_n(&g_pool.done_signal, 0, __ATOMIC_RELEASE);
 
-  /* 等待所有线程完成 */
-  while (atomic_load_explicit(&g_pool.active_count, memory_order_acquire) > 0) {
-    pthread_cond_wait(&g_pool.done_cv, &g_pool.mutex);
+  /* 唤醒需要的 worker */
+  for (int t = 0; t < num_threads; t++) {
+    __atomic_store_n(&g_pool.workers[t].signal, 1, __ATOMIC_RELEASE);
+    futex_wake(&g_pool.workers[t].signal, 1);
   }
 
-  pthread_mutex_unlock(&g_pool.mutex);
+  /* --- 等待完成（直接 futex_wait，不自旋，避免忙等竞态） --- */
+  while (!__atomic_load_n(&g_pool.done_signal, __ATOMIC_ACQUIRE)) {
+    futex_wait(&g_pool.done_signal, 0);
+  }
 
   return 0;
 }
@@ -269,18 +265,16 @@ void parallel_for_pool_destroy(void) {
   if (g_pool.num_workers == 0)
     return;
 
-  pthread_mutex_lock(&g_pool.mutex);
-  g_pool.exit_flag = 1;
-  g_pool.phase++; /* 确保所有等待的线程醒来 */
-  pthread_cond_broadcast(&g_pool.work_cv);
-  pthread_mutex_unlock(&g_pool.mutex);
+  __atomic_store_n(&g_pool.exit_flag, 1, __ATOMIC_RELEASE);
+
+  for (int i = 0; i < g_pool.num_workers; i++) {
+    __atomic_store_n(&g_pool.workers[i].signal, 1, __ATOMIC_RELEASE);
+    futex_wake(&g_pool.workers[i].signal, 1);
+  }
 
   for (int i = 0; i < g_pool.num_workers; i++) {
     pthread_join(g_pool.workers[i].thread, NULL);
   }
 
-  pthread_mutex_destroy(&g_pool.mutex);
-  pthread_cond_destroy(&g_pool.work_cv);
-  pthread_cond_destroy(&g_pool.done_cv);
   g_pool.num_workers = 0;
 }
