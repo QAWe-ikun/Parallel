@@ -12,7 +12,8 @@
 | [task3](./task3/) | Pthreads 并行矩阵乘法与数组求和 | POSIX pthreads | ✅ 完成 |
 | [task4](./task4/) | Pthreads 一元二次方程求解与蒙特卡洛求π | pthreads + 条件变量 | ✅ 完成 |
 | [task5](./task5/) | OpenMP 与 Pthreads parallel_for 矩阵乘法 | OpenMP, Pthreads, 动态链接库 | ✅ 完成 |
-| task6 | *待开发* | - | ⏳ 进行中 |
+| [task6](./task6/) | Pthreads 线程池 parallel_for 与热传导模拟 | pthreads, futex, 线程池 | ✅ 完成 |
+| [task7](./task7/) | MPI 并行 FFT 与 parallel_for 性能分析 | MPI, Valgrind massif | ✅ 完成 |
 
 ---
 
@@ -22,9 +23,9 @@
 
 | 模型 | 实验 | 特点 |
 |------|------|------|
-| **MPI** | task1, task2 | 分布式内存，进程间通信 |
-| **OpenMP** | task5 | 共享内存，编译器指令 |
-| **Pthreads** | task3, task4, task5 | 共享内存，底层线程 API |
+| **MPI** | task1, task2, task7 | 分布式内存，进程间通信 |
+| **OpenMP** | task5, task6 | 共享内存，编译器指令 |
+| **Pthreads** | task3, task4, task5, task6 | 共享内存，底层线程 API |
 
 ### 优化技术
 
@@ -33,7 +34,9 @@
 - **Intel MKL 库** - task0
 - **B 矩阵转置优化缓存** - task5
 - **SIMD 向量化** - task0
-- **多线程并行** - task3, task4, task5
+- **多线程并行** - task3, task4, task5, task6
+- **Futex 混合自旋** - task6（用户态自旋 + Linux futex，对标 libgomp）
+- **线程池复用** - task6（避免反复创建销毁线程）
 
 ---
 
@@ -51,7 +54,7 @@ cat README.md
 # Windows (task0, task1, task2)
 compile.bat
 
-# Linux/WSL (task3, task4, task5)
+# Linux/WSL (task3, task4, task5, task6, task7)
 chmod +x compile.sh
 ./compile.sh
 ```
@@ -68,6 +71,8 @@ chmod +x compile.sh
 | task2 (MPI) | ~12x | 集合通信优化 |
 | task5 (OpenMP) | ~8x | 8 线程，2048×2048 矩阵 |
 | task5 (Pthreads) | ~7.5x | 8 线程，2048×2048 矩阵 |
+| task6 (OpenMP) | ~4.5x | 8 线程，500×500 热传导 |
+| task6 (futex 自旋) | **5.03x** | 8 线程，STATIC 调度 |
 
 ---
 
@@ -76,12 +81,14 @@ chmod +x compile.sh
 每个实验的详细报告位于对应目录的 `report/` 子目录中：
 
 ```
-task0/report/实验报告.md
-task1/report/实验报告.md
-task2/report/实验报告.md
-task3/report/实验报告.md
-task4/report/实验报告.md
-task5/report/实验报告.md
+task0/report/report.md
+task1/report/report.md
+task2/report/report.md
+task3/report/report.md
+task4/report/report.md
+task5/report/report.md
+task6/report/report.md
+task7/report/report.md
 ```
 
 ---
@@ -132,6 +139,30 @@ task5/report/实验报告.md
 - **B 矩阵转置优化**: 提升缓存命中率
 - **墙上时间计时**: 正确使用 clock_gettime 而非 clock()
 
+### task6: Pthreads 线程池与热传导模拟
+
+基于 Pthreads 构造线程池实现 parallel_for，应用于稳态热传导（Jacobi 迭代）：
+
+- **线程池设计**: 常驻工作线程 + per-worker condvar 唤醒
+- **三种调度策略**: STATIC / DYNAMIC / GUIDED
+- **Futex 混合自旋**: 用户态自旋 30 万次 → 超时才 futex_wait 进内核
+  - 对标 OpenMP (libgomp) 的 GOMP_SPINCOUNT 机制
+  - 同步开销从 ~50μs/次 降至 ~14μs/次
+- **性能**: N=512 T=8 STATIC 达到 **5.03x** 加速比（效率 63%）
+
+### task7: MPI 并行 FFT 与性能分析
+
+**Part 1 — MPI 并行 FFT**：
+- 在 step() 函数的 j 循环上做数据分配（与 OpenMP 相同策略）
+- 各进程计算自己的 j 区间，MPI_Allreduce(SUM) 合并
+- 单个 local_y 缓冲区解决 c/d 内存重叠问题
+- 通信量分析：O(N log N)，与计算量同阶
+
+**Part 2 — parallel_for 并行应用分析**：
+- 不同问题规模（N = 64, 128, 256, 512）和线程数（T = 1, 2, 4, 8）
+- 三种调度策略（STATIC / DYNAMIC / GUIDED）横向对比
+- Valgrind massif 内存分析（--stacks=yes 采集栈内存）
+
 ---
 
 ## 🔧 环境要求
@@ -141,6 +172,8 @@ task5/report/实验报告.md
 | task0 | GCC/MSVC | Windows/Linux |
 | task1, task2 | MS-MPI | Windows |
 | task3, task4, task5 | GCC + pthreads | Linux/WSL |
+| task6 | GCC + pthreads + Linux headers | Linux/WSL（需要 futex） |
+| task7 | GCC + OpenMPI | Linux/WSL（需要 MPI + Valgrind） |
 
 ---
 
